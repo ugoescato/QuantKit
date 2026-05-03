@@ -30,9 +30,10 @@ class DigitalOption(Option):
         self.payout = payout
 
 class OneTouchOption(Option):
-    def __init__(self, S, K, r, T, sigma, q, option_type, nb_sim=10_000, nb_steps=252, payout=1, seed=123):
+    def __init__(self, S, K, r, T, sigma, q, option_type, paid_at_maturity=True, nb_sim=10_000, nb_steps=252, payout=1, seed=123):
         super().__init__(S, K, r, T, sigma, q, option_type, nb_sim, nb_steps, seed)
         self.payout = payout
+        self.paid_at_maturity = paid_at_maturity
 
 class BarrierOption(Option):
     def __init__(self, S, K, r, T, sigma, q, option_type, H, barrier_type, direction, exercise_type, nb_sim=10_000, nb_steps=252, seed=123):
@@ -71,45 +72,53 @@ class NumericalGreeks:
 
     def greeks(self):
         option = self.option
-        h_S = option.S * 0.01
-        h_v = 0.01
+        h_S = option.S * 0.01      # delta
+        h_S2 = option.S * 0.05     # gamma, vanna, charm
+        h_v = 0.01                 # vega
+        h_v2 = 0.05                # volga, vanna
         h_t = 1 / 365
         h_r = 0.0001
 
+        np.random.seed(option.seed)
         price_base = self.pricing_function(option)
 
         def bump(**kwargs):
             o = copy.copy(option) # shallow copy of the option, avoids modifying the original
             for k, v in kwargs.items(): # overwrite only the bumped parameter(s)
                 setattr(o, k, v)
+            np.random.seed(option.seed)
             return self.pricing_function(o) # reprice with the bumped parameter
 
         up_S  = bump(S=option.S + h_S)
         dn_S  = bump(S=option.S - h_S)
         delta = (up_S - dn_S) / (2 * h_S)
-        gamma = (up_S - 2 * price_base + dn_S) / h_S**2
+
+        up_S2  = bump(S=option.S + h_S2)
+        dn_S2  = bump(S=option.S - h_S2)
+        gamma = (up_S2 - 2 * price_base + dn_S2) / h_S2**2
 
         up_v  = bump(sigma=option.sigma + h_v)
         dn_v  = bump(sigma=option.sigma - h_v)
         vega  = (up_v - dn_v) / (2 * h_v) / 100
-        volga = (up_v - 2 * price_base + dn_v) / h_v**2
+
+        up_v2  = bump(sigma=option.sigma + h_v2)
+        dn_v2  = bump(sigma=option.sigma - h_v2)
+        volga = (up_v2 - 2 * price_base + dn_v2) / h_v2**2
 
         theta = (bump(T=option.T - h_t) - price_base) / h_t / 365
 
         rho = (bump(r=option.r + h_r) - bump(r=option.r - h_r)) / (2 * h_r) / 100
 
         vanna = (
-            bump(S=option.S + h_S, sigma=option.sigma + h_v)
-          - bump(S=option.S + h_S, sigma=option.sigma - h_v)
-          - bump(S=option.S - h_S, sigma=option.sigma + h_v)
-          + bump(S=option.S - h_S, sigma=option.sigma - h_v) 
-        ) / (4 * h_S * h_v)
+            bump(S=option.S + h_S2, sigma=option.sigma + h_v2)
+          - bump(S=option.S + h_S2, sigma=option.sigma - h_v2)
+          - bump(S=option.S - h_S2, sigma=option.sigma + h_v2)
+          + bump(S=option.S - h_S2, sigma=option.sigma - h_v2) 
+        ) / (4 * h_S2 * h_v2)
 
-        delta_t1 = (
-            bump(S=option.S + h_S, T=option.T - h_t)
-          - bump(S=option.S - h_S, T=option.T - h_t)
-        ) / (2 * h_S)
-        charm = (delta_t1 - delta) / h_t
+        delta_up_t = (bump(S=option.S + h_S2, T=option.T + h_t) - bump(S=option.S - h_S2, T=option.T + h_t)) / (2 * h_S2)
+        delta_dn_t = (bump(S=option.S + h_S2, T=option.T - h_t) - bump(S=option.S - h_S2, T=option.T - h_t)) / (2 * h_S2)
+        charm = (delta_up_t - delta_dn_t) / (2 * h_t)
 
         return {
             "Delta": delta, "Gamma": gamma, "Vega": vega, "Theta": theta,
@@ -205,9 +214,24 @@ class BS_Analytical:
             'Vega': vega, 
             'Theta': theta, 
             'Rho': rho
-        } 
+        }
 
         return greeks
+
+    def one_touch_option_price(self, option: OneTouchOption) -> float:
+        mu = option.r - option.q - 0.5 * option.sigma**2
+        b  = np.log(option.K / option.S) 
+        
+        term1 = norm.cdf((-b + mu * option.T) / (option.sigma * np.sqrt(option.T)))
+        term2 = np.exp(2 * mu * b / option.sigma**2) * norm.cdf((-b - mu * option.T) / (option.sigma * np.sqrt(option.T)))
+        
+        if option.K > option.S:
+            prob = term1 + term2
+        else:
+            prob = norm.cdf((b - mu * option.T) / (option.sigma * np.sqrt(option.T))) + \
+                np.exp(2 * mu * b / option.sigma**2) * norm.cdf((b + mu * option.T) / (option.sigma * np.sqrt(option.T)))
+        
+        return option.payout * np.exp(-option.r * option.T) * prob
     
 ##########################################################################################################################################################################################################
 
@@ -220,14 +244,14 @@ class BS_Binomial:
         p = (np.exp((option.r - option.q) * dt) - d) / (u - d)
         discount = np.exp(-option.r * dt)
 
-        final_prices = np.array([option.S * (u ** (self.steps - 2 * j)) for j in range(self.steps + 1)])
+        final_prices = np.array([option.S * (u ** (option.nb_steps - 2 * j)) for j in range(option.nb_steps + 1)])
 
         if option.option_type == 'call':
             payoff = np.maximum(final_prices - option.K, 0)
         else:
             payoff = np.maximum(option.K - final_prices, 0)
 
-        for i in range(self.steps - 1, -1, -1):
+        for i in range(option.nb_steps - 1, -1, -1):
             payoff = discount * (p * payoff[:i + 1] + (1 - p) * payoff[1:i + 2])
             node_prices = np.array([option.S * (u ** (i - 2 * j)) for j in range(i + 1)])
             if option.option_type == 'call':
