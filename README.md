@@ -1,1 +1,1 @@
-A collection of focused projects on derivatives products and quantitative finance.
+A collection of focused projects on quantitative finance.
